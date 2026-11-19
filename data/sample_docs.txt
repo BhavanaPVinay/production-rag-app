@@ -1,0 +1,10 @@
+Retrieval-Augmented Generation (RAG) is an AI architecture that enhances the capabilities of Large Language Models (LLMs) by augmenting prompt queries with relevant data retrieved from an external knowledge base. This approach mitigates hallucinations, provides up-to-date domain knowledge, and allows organizations to query proprietary documents without model fine-tuning.
+
+Vector embeddings are numerical vector representations of textual or multimodal data in a continuous high-dimensional space. Modern models map semantically similar sentences to nearby coordinates in vector space. Common distance metrics used to compute similarity between embeddings include cosine distance, dot product, and Euclidean distance (L2 norm).
+
+ChromaDB is an open-source, AI-native embedding database designed for developer productivity. It operates either in-memory or persisted on local storage via SQLite and Parquet files, utilizing the Hierarchical Navigable Small World (HNSW) algorithm for fast, approximate nearest neighbor (ANN) vector search.
+
+SentenceTransformers is a Python framework built on top of PyTorch and Hugging Face Transformers for state-of-the-art sentence, text, and image embeddings. Models such as 'all-MiniLM-L6-v2' provide a balanced trade-off between inference latency and embedding quality, outputting 384-dimensional dense vectors.
+
+Document chunking is a critical preprocessing step in RAG pipelines. Text is split into coherent segments (chunks) based on fixed token lengths, sentences, or semantic boundaries, often with a sliding overlap window to maintain context across chunk boundaries. Proper chunk sizing directly impacts retrieval precision.
+
