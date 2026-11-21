@@ -1,17 +1,49 @@
-# Production RAG API
+# Production RAG App
 
-A production-ready Retrieval-Augmented Generation (RAG) backend service built with **FastAPI**, **PyTorch SentenceTransformers**, and **ChromaDB**.
+A containerised, production-style Retrieval-Augmented Generation (RAG) application built with **FastAPI**, **PyTorch SentenceTransformers** and **ChromaDB**. It combines hybrid (keyword + semantic) search with grounded answers, and includes an automated evaluation pipeline to measure retrieval and answer quality.
 
 ---
 
 ## Features
 
+- **Hybrid Search**: Combines keyword (BM25) and semantic retrieval, so exact terms and meaning both count.
 - **Semantic Embedding Generation**: Uses PyTorch and SentenceTransformers (`all-MiniLM-L6-v2`) to generate 384-dimensional dense vectors.
 - **Persistent Vector Database**: Embeddings and metadata are indexed and persisted on disk using **ChromaDB** with cosine similarity.
-- **Grounded `/ask` Endpoint**: Performs semantic retrieval, filters chunks below similarity thresholds, extracts answers, provides source citations, and computes a grounding score to mitigate hallucinations.
+- **Grounded `/ask` Endpoint**: Retrieves chunks, filters those below similarity thresholds, extracts answers, provides source citations and computes a grounding score to mitigate hallucinations.
 - **Augmented Prompt `/query` Endpoint**: Retrieves relevant context and builds ready-to-use LLM prompt templates.
-- **Automatic Ingestion & Lifespan Management**: Automatically indexes knowledge base documents (`data/sample_docs.txt`) on service startup if the collection is empty.
-- **Dockerized**: Containerized with a slim Python 3.11 base image for portable, isolated deployments.
+- **Automated Evaluation**: A script that measures retrieval hit rate and answer groundedness on a set of test questions.
+- **Automatic Ingestion & Lifespan Management**: Indexes knowledge base documents (`data/sample_docs.txt`) on startup if the collection is empty.
+- **Dockerised**: Slim Python 3.11 base image for portable, isolated deployments.
+
+---
+
+## Architecture
+
+```text
+Documents ──► SentenceTransformer embeddings ──► ChromaDB (persistent, cosine)
+                                                       │
+User question ──► embed ──► semantic top-k ────────────┤
+                  keyword (BM25) top-k ────────────────┤
+                                   ▼
+                       merge results (hybrid search)
+                                   ▼
+              similarity filter ──► grounding score ──► answer + citations
+                                   │
+                              FastAPI (/ask, /query, /index, /health)
+```
+
+---
+
+## Tech Stack
+
+| Layer | Tools |
+| --- | --- |
+| API | FastAPI, Uvicorn |
+| Embeddings | PyTorch, SentenceTransformers (`all-MiniLM-L6-v2`) |
+| Vector database | ChromaDB (cosine similarity) |
+| Keyword search | BM25 |
+| Evaluation | Python evaluation script |
+| Packaging | Docker (Python 3.11 slim) |
 
 ---
 
@@ -23,10 +55,11 @@ production-rag-app/
 ├── requirements.txt            # Python dependencies
 ├── .gitignore                  # Git ignore rules
 ├── README.md                   # Project documentation
+├── evaluate.py                 # Evaluation pipeline (retrieval and answer quality)
 ├── app/
 │   ├── __init__.py             # Python package marker
 │   ├── main.py                 # FastAPI application, schemas & endpoints
-│   └── rag_pipeline.py         # Embedding, retrieval, and grounding engine
+│   └── rag_pipeline.py         # Embedding, hybrid retrieval, and grounding engine
 └── data/
     └── sample_docs.txt         # Knowledge base documents
 ```
@@ -43,11 +76,9 @@ production-rag-app/
 ### 1. Clone & Set Up Virtual Environment
 
 ```bash
-# Clone the repository
-git clone https://github.com/<your-username>/production-rag-app.git
+git clone https://github.com/BhavanaPVinay/production-rag-app.git
 cd production-rag-app
 
-# Create and activate virtual environment
 python -m venv venv
 
 # Windows (PowerShell)
@@ -70,8 +101,7 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-The interactive OpenAPI Swagger documentation will be available at:
-**http://localhost:8000/docs**
+Interactive API documentation: **http://localhost:8000/docs**
 
 ---
 
@@ -79,7 +109,7 @@ The interactive OpenAPI Swagger documentation will be available at:
 
 ### 1. Health Check
 - **`GET /health`**
-- Returns server status, active embedding model, collection name, and total indexed chunks.
+- Returns server status, active embedding model, collection name and total indexed chunks.
 
 ```bash
 curl -X GET http://localhost:8000/health
@@ -87,7 +117,7 @@ curl -X GET http://localhost:8000/health
 
 ### 2. Grounded Question Answering (`/ask`)
 - **`POST /ask`**
-- Retrieves relevant documents, applies a minimum similarity threshold filter, extracts a grounded response, generates citations, and reports grounding metrics.
+- Retrieves relevant documents, applies a minimum similarity filter, extracts a grounded response, generates citations and reports grounding metrics.
 
 ```bash
 curl -X POST http://localhost:8000/ask \
@@ -99,7 +129,7 @@ curl -X POST http://localhost:8000/ask \
   }'
 ```
 
-**Response Example:**
+**Response example:**
 ```json
 {
   "query": "How does ChromaDB perform vector search?",
@@ -144,20 +174,34 @@ curl -X POST http://localhost:8000/index
 
 ---
 
+## Evaluation
+
+```bash
+python evaluate.py
+```
+
+Runs a set of test questions through the pipeline and reports retrieval hit rate and answer groundedness.
+
+| Metric | Result |
+| --- | --- |
+| Test questions | [N] |
+| Retrieval hit rate (top-k), semantic only | [value] |
+| Retrieval hit rate (top-k), hybrid | [value] |
+| Average grounding ratio | [value] |
+| Average response time | [value] |
+
+---
+
 ## Docker Deployment
 
-### Build the Image
 ```bash
 docker build -t production-rag-app .
-```
-
-### Run the Container
-```bash
 docker run -d -p 8000:8000 --name rag-service production-rag-app
-```
-
-Check health:
-```bash
 curl http://localhost:8000/health
 ```
 
+---
+
+## Roadmap
+
+- Unit tests and a GitHub Actions workflow
