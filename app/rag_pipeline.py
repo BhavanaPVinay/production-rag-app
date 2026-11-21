@@ -30,7 +30,7 @@ class RAGPipeline:
             metadata={"hnsw:space": "cosine"},
         )
 
-        # Build BM25 keyword index from any already-persisted documents
+        # Build BM25 keyword index from persisted documents
         self._corpus_items: List[Dict[str, Any]] = []
         self._bm25: Optional[BM25Okapi] = None
         self._rebuild_bm25_index()
@@ -69,18 +69,15 @@ class RAGPipeline:
         with open(file_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        raw_chunks = content.split("\n\n")
-        chunks = [c.strip() for c in raw_chunks if c.strip()]
-
+        chunks = [c.strip() for c in content.split("\n\n") if c.strip()]
         if not chunks:
             return 0
 
-        ids = [f"doc_{i+1}" for i in range(len(chunks))]
+        ids = [f"doc_{i + 1}" for i in range(len(chunks))]
         metadatas = [
             {"source": os.path.basename(file_path), "chunk_index": i + 1}
             for i in range(len(chunks))
         ]
-
         embeddings = self.model.encode(chunks, convert_to_numpy=True).tolist()
 
         self.collection.upsert(
@@ -90,12 +87,11 @@ class RAGPipeline:
             metadatas=metadatas,
         )
 
-        # Keep BM25 in sync with newly indexed chunks
         self._rebuild_bm25_index()
         return len(chunks)
 
     def retrieve(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        """Encodes user query and retrieves top-k most semantically relevant documents."""
+        """Encodes user query and retrieves top-k semantically relevant documents."""
         if self.collection.count() == 0:
             return []
 
@@ -201,14 +197,12 @@ class RAGPipeline:
         contexts: List[Dict[str, Any]],
         min_similarity: float = 0.35,
     ) -> List[Dict[str, Any]]:
-        """Keeps retrieved chunks that meet min_similarity or were matched via BM25 hybrid search."""
-        filtered: List[Dict[str, Any]] = []
-        for item in contexts:
-            sim = item.get("similarity", 0.0)
-            bm25_rank = item.get("bm25_rank")
-            if sim >= min_similarity or (bm25_rank is not None and item.get("bm25_score", 0.0) > 0):
-                filtered.append(item)
-        return filtered
+        """Keeps only retrieved chunks that meet the minimum similarity threshold."""
+        return [
+            item
+            for item in contexts
+            if item.get("similarity", 0.0) >= min_similarity
+        ]
 
     def _extractive_fallback_answer(self, query: str, contexts: List[Dict[str, Any]]) -> str:
         """Offline-safe fallback that selects the most relevant sentences from top chunks."""
@@ -221,8 +215,7 @@ class RAGPipeline:
         scored_sentences: List[tuple[int, str]] = []
         for ctx in contexts:
             doc_text = ctx.get("document", "")
-            sentences = re.split(r"(?<=[.!?])\s+", doc_text.strip())
-            for sent in sentences:
+            for sent in re.split(r"(?<=[.!?])\s+", doc_text.strip()):
                 sent_clean = sent.strip()
                 if not sent_clean:
                     continue
@@ -231,8 +224,7 @@ class RAGPipeline:
                     for token in re.findall(r"[a-zA-Z0-9]+", sent_clean)
                     if len(token) > 2
                 }
-                overlap = len(query_terms & sent_tokens)
-                scored_sentences.append((overlap, sent_clean))
+                scored_sentences.append((len(query_terms & sent_tokens), sent_clean))
 
         scored_sentences.sort(key=lambda pair: pair[0], reverse=True)
         top_sentences = [sent for score, sent in scored_sentences[:2] if score > 0]
@@ -243,7 +235,7 @@ class RAGPipeline:
         return " ".join(top_sentences) if top_sentences else "Insufficient context to answer the question."
 
     def check_grounding(self, answer: str, contexts: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Checks what fraction of content words in the answer appear in the retrieved contexts."""
+        """Checks what fraction of content words in the answer appear in retrieved contexts."""
         context_corpus = " ".join(item.get("document", "") for item in contexts).lower()
         context_tokens = set(re.findall(r"[a-zA-Z0-9]+", context_corpus))
 
@@ -277,7 +269,7 @@ class RAGPipeline:
         min_similarity: float = 0.35,
         use_hybrid: bool = True,
     ) -> Dict[str, Any]:
-        """Retrieves chunks (hybrid or dense), filters noise, synthesizes an answer, and checks grounding."""
+        """Retrieves chunks, applies similarity filtering, synthesizes an answer, and checks grounding."""
         raw_contexts = (
             self.hybrid_retrieve(query=query, top_k=top_k)
             if use_hybrid
@@ -323,7 +315,6 @@ class RAGPipeline:
     def query_and_augment(self, query: str, top_k: int = 3) -> Dict[str, Any]:
         """Retrieves matching chunks and builds an augmented prompt for LLM consumption."""
         contexts = self.hybrid_retrieve(query=query, top_k=top_k)
-
         context_block = "\n\n---\n\n".join([item["document"] for item in contexts])
 
         augmented_prompt = (
