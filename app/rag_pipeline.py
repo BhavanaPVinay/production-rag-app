@@ -1,21 +1,214 @@
 import os
-from typing import Any, Dict, List, Optional
-import chromadb
-from sentence_transformers import SentenceTransformer
 import re
+from typing import Any, Dict, List, Optional
+
+import chromadb
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
 
 
 class RAGPipeline:
-    """Core RAG engine managing embedding generation, vector storage, and similarity retrieval."""
-    
+    """Core RAG engine managing embedding generation, vector storage, hybrid retrieval, and grounding."""
+
+    def __init__(
+        self,
+        model_name: str = "all-MiniLM-L6-v2",
+        persist_directory: str = "./chroma_db",
+        collection_name: str = "documents_collection",
+    ):
+        self.model_name = model_name
+        self.persist_directory = persist_directory
+        self.collection_name = collection_name
+
+        # Load PyTorch SentenceTransformer model for dense vector embeddings
+        self.model = SentenceTransformer(self.model_name)
+
+        # Initialize persistent ChromaDB storage
+        self.chroma_client = chromadb.PersistentClient(path=self.persist_directory)
+        self.collection = self.chroma_client.get_or_create_collection(
+            name=self.collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+
+        # Build BM25 keyword index from any already-persisted documents
+        self._corpus_items: List[Dict[str, Any]] = []
+        self._bm25: Optional[BM25Okapi] = None
+        self._rebuild_bm25_index()
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        return [tok.lower() for tok in re.findall(r"[a-zA-Z0-9]+", text)]
+
+    def _rebuild_bm25_index(self) -> None:
+        """Builds an in-memory BM25 lexical index over all chunks currently in ChromaDB."""
+        data = self.collection.get(include=["documents", "metadatas"])
+        docs = data.get("documents") or []
+        metas = data.get("metadatas") or []
+        ids = data.get("ids") or []
+
+        self._corpus_items = [
+            {
+                "id": doc_id,
+                "document": doc_text,
+                "metadata": meta or {},
+            }
+            for doc_id, doc_text, meta in zip(ids, docs, metas)
+        ]
+        tokenized_docs = [self._tokenize(item["document"]) for item in self._corpus_items]
+        self._bm25 = BM25Okapi(tokenized_docs) if tokenized_docs else None
+
+    def get_document_count(self) -> int:
+        """Returns the current number of documents stored in the ChromaDB collection."""
+        return self.collection.count()
+
+    def index_file(self, file_path: str) -> int:
+        """Reads a text file, splits by double newline paragraphs, and indexes into ChromaDB."""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Source file not found at: {file_path}")
+
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        raw_chunks = content.split("\n\n")
+        chunks = [c.strip() for c in raw_chunks if c.strip()]
+
+        if not chunks:
+            return 0
+
+        ids = [f"doc_{i+1}" for i in range(len(chunks))]
+        metadatas = [
+            {"source": os.path.basename(file_path), "chunk_index": i + 1}
+            for i in range(len(chunks))
+        ]
+
+        embeddings = self.model.encode(chunks, convert_to_numpy=True).tolist()
+
+        self.collection.upsert(
+            ids=ids,
+            documents=chunks,
+            embeddings=embeddings,
+            metadatas=metadatas,
+        )
+
+        # Keep BM25 in sync with newly indexed chunks
+        self._rebuild_bm25_index()
+        return len(chunks)
+
+    def retrieve(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """Encodes user query and retrieves top-k most semantically relevant documents."""
+        if self.collection.count() == 0:
+            return []
+
+        actual_k = min(top_k, self.collection.count())
+        query_embedding = self.model.encode([query], convert_to_numpy=True).tolist()
+
+        results = self.collection.query(
+            query_embeddings=query_embedding,
+            n_results=actual_k,
+            include=["documents", "metadatas", "distances"],
+        )
+
+        retrieved: List[Dict[str, Any]] = []
+        if results.get("documents") and results["documents"][0]:
+            docs = results["documents"][0]
+            metas = results["metadatas"][0] if results.get("metadatas") else [{}] * len(docs)
+            distances = results["distances"][0] if results.get("distances") else [0.0] * len(docs)
+
+            for doc, meta, dist in zip(docs, metas, distances):
+                similarity = max(0.0, 1.0 - dist) if dist is not None else 0.0
+                retrieved.append(
+                    {
+                        "document": doc,
+                        "metadata": meta,
+                        "distance": round(float(dist), 4) if dist is not None else 0.0,
+                        "similarity": round(float(similarity), 4),
+                    }
+                )
+
+        return retrieved
+
+    def hybrid_retrieve(
+        self,
+        query: str,
+        top_k: int = 3,
+        rrf_k: int = 60,
+        dense_weight: float = 0.5,
+        bm25_weight: float = 0.5,
+    ) -> List[Dict[str, Any]]:
+        """Combines dense semantic search and BM25 keyword search using Reciprocal Rank Fusion."""
+        if self.collection.count() == 0:
+            return []
+
+        if self._bm25 is None and self._corpus_items:
+            self._rebuild_bm25_index()
+
+        candidate_k = min(max(top_k * 2, 5), self.collection.count())
+        dense_results = self.retrieve(query=query, top_k=candidate_k)
+
+        dense_rank_map: Dict[str, int] = {}
+        dense_item_map: Dict[str, Dict[str, Any]] = {}
+        for rank, item in enumerate(dense_results, start=1):
+            key = item["document"]
+            dense_rank_map[key] = rank
+            dense_item_map[key] = item
+
+        bm25_rank_map: Dict[str, int] = {}
+        bm25_item_map: Dict[str, Dict[str, Any]] = {}
+        if self._bm25 and self._corpus_items:
+            query_tokens = self._tokenize(query)
+            scores = self._bm25.get_scores(query_tokens)
+            ranked_indices = sorted(
+                range(len(scores)),
+                key=lambda idx: scores[idx],
+                reverse=True,
+            )[:candidate_k]
+
+            for rank, idx in enumerate(ranked_indices, start=1):
+                entry = self._corpus_items[idx]
+                key = entry["document"]
+                bm25_rank_map[key] = rank
+                bm25_item_map[key] = {
+                    "document": entry["document"],
+                    "metadata": entry["metadata"],
+                    "distance": 1.0,
+                    "similarity": 0.0,
+                    "bm25_score": round(float(scores[idx]), 4),
+                }
+
+        all_keys = set(dense_rank_map) | set(bm25_rank_map)
+        fused: List[Dict[str, Any]] = []
+
+        for key in all_keys:
+            rrf_score = 0.0
+            if key in dense_rank_map:
+                rrf_score += dense_weight * (1.0 / (rrf_k + dense_rank_map[key]))
+            if key in bm25_rank_map:
+                rrf_score += bm25_weight * (1.0 / (rrf_k + bm25_rank_map[key]))
+
+            merged = dict(dense_item_map.get(key) or bm25_item_map[key])
+            if key in bm25_item_map and "bm25_score" in bm25_item_map[key]:
+                merged["bm25_score"] = bm25_item_map[key]["bm25_score"]
+            merged["dense_rank"] = dense_rank_map.get(key)
+            merged["bm25_rank"] = bm25_rank_map.get(key)
+            merged["rrf_score"] = round(rrf_score, 6)
+            fused.append(merged)
+
+        fused.sort(key=lambda x: x["rrf_score"], reverse=True)
+        return fused[:top_k]
 
     def filter_by_similarity(
         self,
         contexts: List[Dict[str, Any]],
         min_similarity: float = 0.35,
     ) -> List[Dict[str, Any]]:
-        """Keeps only retrieved chunks that meet the minimum similarity threshold."""
-        return [item for item in contexts if item.get("similarity", 0.0) >= min_similarity]
+        """Keeps retrieved chunks that meet min_similarity or were matched via BM25 hybrid search."""
+        filtered: List[Dict[str, Any]] = []
+        for item in contexts:
+            sim = item.get("similarity", 0.0)
+            bm25_rank = item.get("bm25_rank")
+            if sim >= min_similarity or (bm25_rank is not None and item.get("bm25_score", 0.0) > 0):
+                filtered.append(item)
+        return filtered
 
     def _extractive_fallback_answer(self, query: str, contexts: List[Dict[str, Any]]) -> str:
         """Offline-safe fallback that selects the most relevant sentences from top chunks."""
@@ -56,7 +249,7 @@ class RAGPipeline:
 
         stop_words = {
             "the", "and", "for", "with", "that", "this", "from", "into",
-            "are", "was", "were", "can", "has", "have", "its", "via", "based"
+            "are", "was", "were", "can", "has", "have", "its", "via", "based",
         }
         answer_tokens = [
             tok.lower()
@@ -82,9 +275,14 @@ class RAGPipeline:
         query: str,
         top_k: int = 3,
         min_similarity: float = 0.35,
+        use_hybrid: bool = True,
     ) -> Dict[str, Any]:
-        """Retrieves chunks, filters weak matches, synthesizes an answer, and checks grounding."""
-        raw_contexts = self.retrieve(query=query, top_k=top_k)
+        """Retrieves chunks (hybrid or dense), filters noise, synthesizes an answer, and checks grounding."""
+        raw_contexts = (
+            self.hybrid_retrieve(query=query, top_k=top_k)
+            if use_hybrid
+            else self.retrieve(query=query, top_k=top_k)
+        )
         filtered_contexts = self.filter_by_similarity(raw_contexts, min_similarity=min_similarity)
 
         if not filtered_contexts:
@@ -122,105 +320,10 @@ class RAGPipeline:
             "grounding": grounding_report,
         }
 
-
-    def __init__(
-        self,
-        model_name: str = "all-MiniLM-L6-v2",
-        persist_directory: str = "./chroma_db",
-        collection_name: str = "documents_collection",
-    ):
-        self.model_name = model_name
-        self.persist_directory = persist_directory
-        self.collection_name = collection_name
-
-        # Load PyTorch SentenceTransformer model for dense vector embeddings
-        self.model = SentenceTransformer(self.model_name)
-
-        # Initialize persistent ChromaDB storage
-        self.chroma_client = chromadb.PersistentClient(path=self.persist_directory)
-        self.collection = self.chroma_client.get_or_create_collection(
-            name=self.collection_name,
-            metadata={"hnsw:space": "cosine"}
-        )
-
-    def get_document_count(self) -> int:
-        """Returns the current number of documents stored in the ChromaDB collection."""
-        return self.collection.count()
-
-    def index_file(self, file_path: str) -> int:
-        """Reads a text file, splits by double newline paragraphs, and indexes into ChromaDB."""
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Source file not found at: {file_path}")
-
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        # Split into distinct paragraph chunks
-        raw_chunks = content.split("\n\n")
-        chunks = [c.strip() for c in raw_chunks if c.strip()]
-
-        if not chunks:
-            return 0
-
-        # Unique document identifiers and metadata
-        ids = [f"doc_{i+1}" for i in range(len(chunks))]
-        metadatas = [
-            {"source": os.path.basename(file_path), "chunk_index": i + 1}
-            for i in range(len(chunks))
-        ]
-
-        # Generate 384-dimensional dense embeddings
-        embeddings = self.model.encode(chunks, convert_to_numpy=True).tolist()
-
-        # Upsert documents and their vector representations into ChromaDB
-        self.collection.upsert(
-            ids=ids,
-            documents=chunks,
-            embeddings=embeddings,
-            metadatas=metadatas,
-        )
-
-        return len(chunks)
-
-    def retrieve(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        """Encodes user query and retrieves top-k most semantically relevant documents."""
-        # Check if collection has documents
-        if self.collection.count() == 0:
-            return []
-
-        # Ensure top_k does not exceed total items in collection
-        actual_k = min(top_k, self.collection.count())
-        query_embedding = self.model.encode([query], convert_to_numpy=True).tolist()
-
-        results = self.collection.query(
-            query_embeddings=query_embedding,
-            n_results=actual_k,
-            include=["documents", "metadatas", "distances"],
-        )
-
-        retrieved: List[Dict[str, Any]] = []
-        if results.get("documents") and results["documents"][0]:
-            docs = results["documents"][0]
-            metas = results["metadatas"][0] if results.get("metadatas") else [{}] * len(docs)
-            distances = results["distances"][0] if results.get("distances") else [0.0] * len(docs)
-
-            for doc, meta, dist in zip(docs, metas, distances):
-                # Cosine distance ranges from 0 (identical) to 2 (opposite)
-                similarity = max(0.0, 1.0 - dist) if dist is not None else 0.0
-                retrieved.append({
-                    "document": doc,
-                    "metadata": meta,
-                    "distance": round(float(dist), 4) if dist is not None else 0.0,
-                    "similarity": round(float(similarity), 4),
-                })
-
-        return retrieved
-
     def query_and_augment(self, query: str, top_k: int = 3) -> Dict[str, Any]:
         """Retrieves matching chunks and builds an augmented prompt for LLM consumption."""
-        contexts = self.retrieve(query=query, top_k=top_k)
+        contexts = self.hybrid_retrieve(query=query, top_k=top_k)
 
-        # Assemble retrieved context strings
         context_block = "\n\n---\n\n".join([item["document"] for item in contexts])
 
         augmented_prompt = (
@@ -235,4 +338,3 @@ class RAGPipeline:
             "retrieved_contexts": contexts,
             "augmented_prompt": augmented_prompt,
         }
-

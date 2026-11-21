@@ -1,0 +1,32 @@
+[
+  {
+    "id": "q1",
+    "query": "How does ChromaDB perform fast approximate nearest neighbor vector search?",
+    "expected_keyword": "HNSW",
+    "description": "Evaluates ChromaDB retrieval for the HNSW search algorithm."
+  },
+  {
+    "id": "q2",
+    "query": "What critical issue does RAG mitigate when working with Large Language Models?",
+    "expected_keyword": "hallucinations",
+    "description": "Evaluates RAG retrieval for hallucination mitigation."
+  },
+  {
+    "id": "q3",
+    "query": "What type of dense representations does SentenceTransformers generate?",
+    "expected_keyword": "embeddings",
+    "description": "Evaluates SentenceTransformers retrieval for dense embeddings."
+  },
+  {
+    "id": "q4",
+    "query": "What distance metrics are commonly used to compute similarity between vector coordinates?",
+    "expected_keyword": "cosine distance",
+    "description": "Evaluates vector similarity metrics retrieval."
+  },
+  {
+    "id": "q5",
+    "query": "Why is sliding window overlap applied during document chunking in RAG pipelines?",
+    "expected_keyword": "chunking",
+    "description": "Evaluates preprocessing and chunking strategy retrieval."
+  }
+]
